@@ -6,31 +6,64 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func TestNewLogService(t *testing.T) {
-	// Create a test database connection
-	pool, err := pgxpool.New(context.Background(), "postgres://postgres:postgres@localhost:5432/logging_test?sslmode=disable")
-	require.NoError(t, err)
-	defer pool.Close()
+type MockDB struct {
+	insertedEntries []LogEntry
+}
 
-	service := NewLogService(pool)
+func (m *MockDB) Begin(ctx context.Context) (Tx, error) {
+	return &MockTx{m, false}, nil
+}
+
+type MockTx struct {
+	db        *MockDB
+	committed bool
+}
+
+func (m *MockTx) Exec(ctx context.Context, sql string, arguments ...interface{}) (pgconn.CommandTag, error) {
+	entry := LogEntry{
+		Level:       arguments[0].(string),
+		Message:     arguments[1].(string),
+		Service:     arguments[2].(string),
+		Environment: arguments[3].(string),
+		Hostname:    arguments[4].(string),
+		IPAddress:   arguments[5].(string),
+		UserID:      arguments[6].(string),
+		RequestID:   arguments[7].(string),
+		Metadata:    arguments[8].(json.RawMessage),
+	}
+	m.db.insertedEntries = append(m.db.insertedEntries, entry)
+	return pgconn.CommandTag{}, nil
+}
+
+func (m *MockTx) Commit(ctx context.Context) error {
+	m.committed = true
+	return nil
+}
+
+func (m *MockTx) Rollback(ctx context.Context) error {
+	if !m.committed {
+		m.db.insertedEntries = m.db.insertedEntries[:len(m.db.insertedEntries)-1]
+	}
+	return nil
+}
+
+func TestNewLogService(t *testing.T) {
+	mockDB := &MockDB{}
+	service := NewLogService(mockDB)
+
 	assert.NotNil(t, service)
-	assert.NotNil(t, service.pool)
+	assert.NotNil(t, service.db)
 	assert.NotNil(t, service.logBuffer)
 }
 
 func TestProcessLog(t *testing.T) {
-	pool, err := pgxpool.New(context.Background(), "postgres://postgres:postgres@localhost:5432/logging_test?sslmode=disable")
-	require.NoError(t, err)
-	defer pool.Close()
+	mockDB := &MockDB{}
+	service := NewLogService(mockDB)
 
-	service := NewLogService(pool)
-
-	// Create a test log entry
 	metadata := json.RawMessage(`{"key": "value"}`)
 	entry := LogEntry{
 		Level:       "INFO",
@@ -44,28 +77,30 @@ func TestProcessLog(t *testing.T) {
 		Metadata:    metadata,
 	}
 
-	// Process the log entry
 	service.ProcessLog(entry)
 
-	// Give some time for the log processor to handle the entry
-	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < 50; i++ {
+		if len(mockDB.insertedEntries) > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	// Verify the log was inserted
-	var count int
-	err = pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM logs WHERE message = $1", entry.Message).Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
+	if len(mockDB.insertedEntries) == 0 {
+		t.Fatal("No entries were inserted")
+	}
+
+	assert.Equal(t, 1, len(mockDB.insertedEntries))
+	assert.Equal(t, entry, mockDB.insertedEntries[0])
 }
 
 func TestBatchProcessing(t *testing.T) {
-	pool, err := pgxpool.New(context.Background(), "postgres://postgres:postgres@localhost:5432/logging_test?sslmode=disable")
-	require.NoError(t, err)
-	defer pool.Close()
+	mockDB := &MockDB{}
+	service := NewLogService(mockDB)
 
-	service := NewLogService(pool)
-
-	// Create multiple test log entries
 	metadata := json.RawMessage(`{"key": "value"}`)
+	expectedEntries := make([]LogEntry, 0, 150)
+
 	for i := 0; i < 150; i++ {
 		entry := LogEntry{
 			Level:       "INFO",
@@ -78,27 +113,31 @@ func TestBatchProcessing(t *testing.T) {
 			RequestID:   "test-request",
 			Metadata:    metadata,
 		}
+		expectedEntries = append(expectedEntries, entry)
 		service.ProcessLog(entry)
 	}
 
-	// Give some time for the log processor to handle the entries
-	time.Sleep(1 * time.Second)
+	for i := 0; i < 50; i++ {
+		if len(mockDB.insertedEntries) == 150 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	// Verify all logs were inserted
-	var count int
-	err = pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM logs WHERE message = $1", "Batch test message").Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 150, count)
+	if len(mockDB.insertedEntries) == 0 {
+		t.Fatal("No entries were inserted")
+	}
+
+	assert.Equal(t, 150, len(mockDB.insertedEntries))
+	for i, entry := range mockDB.insertedEntries {
+		assert.Equal(t, expectedEntries[i], entry)
+	}
 }
 
 func TestInsertBatch(t *testing.T) {
-	pool, err := pgxpool.New(context.Background(), "postgres://postgres:postgres@localhost:5432/logging_test?sslmode=disable")
-	require.NoError(t, err)
-	defer pool.Close()
+	mockDB := &MockDB{}
+	service := NewLogService(mockDB)
 
-	service := NewLogService(pool)
-
-	// Create test entries
 	metadata := json.RawMessage(`{"key": "value"}`)
 	entries := []LogEntry{
 		{
@@ -125,12 +164,13 @@ func TestInsertBatch(t *testing.T) {
 		},
 	}
 
-	// Insert the batch
 	service.insertBatch(entries)
 
-	// Verify the logs were inserted
-	var count int
-	err = pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM logs WHERE message LIKE 'Test batch insert%'").Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 2, count)
+	if len(mockDB.insertedEntries) == 0 {
+		t.Fatal("No entries were inserted")
+	}
+
+	assert.Equal(t, 2, len(mockDB.insertedEntries))
+	assert.Equal(t, entries[0], mockDB.insertedEntries[0])
+	assert.Equal(t, entries[1], mockDB.insertedEntries[1])
 }

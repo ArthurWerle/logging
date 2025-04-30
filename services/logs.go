@@ -6,8 +6,18 @@ import (
 	"log"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+type DB interface {
+	Begin(ctx context.Context) (Tx, error)
+}
+
+type Tx interface {
+	Exec(ctx context.Context, sql string, arguments ...interface{}) (pgconn.CommandTag, error)
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
+}
 
 type LogEntry struct {
 	Level       string          `json:"level"`
@@ -22,13 +32,13 @@ type LogEntry struct {
 }
 
 type LogService struct {
-	pool      *pgxpool.Pool
+	db        DB
 	logBuffer chan LogEntry
 }
 
-func NewLogService(pool *pgxpool.Pool) *LogService {
+func NewLogService(db DB) *LogService {
 	service := &LogService{
-		pool:      pool,
+		db:        db,
 		logBuffer: make(chan LogEntry, 1000),
 	}
 	go service.startLogProcessor()
@@ -66,21 +76,12 @@ func (s *LogService) startLogProcessor() {
 
 func (s *LogService) insertBatch(entries []LogEntry) {
 	ctx := context.Background()
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		log.Printf("Error starting transaction: %v", err)
 		return
 	}
 	defer tx.Rollback(ctx)
-
-	_, err = tx.Exec(ctx, `
-		COPY logs (level, message, service, environment, hostname, ip_address, user_id, request_id, metadata)
-		FROM STDIN
-	`)
-	if err != nil {
-		log.Printf("Error preparing COPY statement: %v", err)
-		return
-	}
 
 	for _, entry := range entries {
 		_, err = tx.Exec(ctx, `

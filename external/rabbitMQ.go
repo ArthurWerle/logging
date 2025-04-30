@@ -17,7 +17,7 @@ func StartRabbitMQ(pool *pgxpool.Pool) {
 		log.Fatal("RABBITMQ_URL environment variable is not set")
 	}
 
-	logService := services.NewLogService(pool)
+	logService := services.NewLogService(services.NewPgxPoolAdapter(pool))
 
 	conn, err := amqp.Dial(rabbitmqURL)
 	utils.FailOnError(err, "Failed to connect to RabbitMQ")
