@@ -29,22 +29,30 @@ func StartRabbitMQ(pool *pgxpool.Pool) {
 
 	q, err := ch.QueueDeclare(
 		"logs",
-		false,
-		false,
-		false,
-		false,
-		nil,
+		true,  // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
 	)
 	utils.FailOnError(err, "Failed to declare a queue")
+
+	// Set QoS to ensure fair distribution of messages
+	err = ch.Qos(
+		1,     // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+	utils.FailOnError(err, "Failed to set QoS")
 
 	msgs, err := ch.Consume(
 		q.Name,
 		"",
-		true,
-		false,
-		false,
-		false,
-		nil,
+		false, // auto-acknowledge set to false
+		false, // exclusive
+		false, // no-local
+		false, // no-wait
+		nil,   // args
 	)
 	utils.FailOnError(err, "Failed to register a consumer")
 
@@ -55,9 +63,11 @@ func StartRabbitMQ(pool *pgxpool.Pool) {
 			var logEntry services.LogEntry
 			if err := json.Unmarshal(d.Body, &logEntry); err != nil {
 				log.Printf("Error parsing message: %v", err)
+				d.Ack(false) // Acknowledge the message even if parsing fails
 				continue
 			}
 			logService.ProcessLog(logEntry)
+			d.Ack(false) // Acknowledge successful processing
 		}
 	}()
 

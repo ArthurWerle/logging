@@ -2,8 +2,18 @@ services:
   rabbitmq:
     image: rabbitmq:latest
     restart: unless-stopped
+    networks:
+      - logs
     env_file:
       - stack.env
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   postgres:
     image: postgres:16-alpine
@@ -14,6 +24,34 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logging -d logs"]
+      interval: 10s 
+      timeout: 5s
+      retries: 5
+      start_period: 30s 
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  logs:
+    networks:
+      - logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    env_file:
+      - stack.env
 
 volumes:
   postgres_data:
+
+networks:
+  logs:
+    driver: bridge
