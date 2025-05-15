@@ -5,9 +5,17 @@ import (
 	"log"
 	"logging/services"
 	"logging/utils"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+var (
+	rabbitConn *amqp.Connection
+	rabbitCh   *amqp.Channel
+	rabbitQ    amqp.Queue
 )
 
 func StartRabbitMQ(pool *pgxpool.Pool) {
@@ -19,34 +27,73 @@ func StartRabbitMQ(pool *pgxpool.Pool) {
 
 	logService := services.NewLogService(services.NewPgxPoolAdapter(pool))
 
-	conn, err := amqp.Dial(rabbitmqURL)
-	utils.FailOnError(err, "Failed to connect to RabbitMQ")
-	defer conn.Close()
+	// Configure connection with heartbeat and recovery
+	config := amqp.Config{
+		Heartbeat: 10 * time.Second,
+		Locale:    "en_US",
+		Properties: amqp.Table{
+			"connection_name": "logs-service",
+		},
+	}
 
-	ch, err := conn.Channel()
-	utils.FailOnError(err, "Failed to open a channel")
-	defer ch.Close()
+	var err error
 
-	q, err := ch.QueueDeclare(
-		"logs",
-		true,  // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
+	// Retry connection with backoff
+	for i := 0; i < 5; i++ {
+		rabbitConn, err = amqp.DialConfig(rabbitmqURL, config)
+		if err == nil {
+			break
+		}
+		log.Printf("Failed to connect to RabbitMQ (attempt %d): %v", i+1, err)
+		time.Sleep(time.Duration(i+1) * time.Second)
+	}
+	if err != nil {
+		log.Panicf("%s: %s", "Failed to connect to RabbitMQ after multiple attempts", err)
+	}
+
+	// Handle connection close
+	go func() {
+		<-rabbitConn.NotifyClose(make(chan *amqp.Error))
+		log.Printf("Connection to RabbitMQ closed, attempting to reconnect...")
+		StartRabbitMQ(pool) // Restart the connection
+	}()
+
+	rabbitCh, err = rabbitConn.Channel()
+	if err != nil {
+		log.Panicf("%s: %s", "Failed to open a channel", err)
+	}
+
+	// Handle channel close
+	go func() {
+		<-rabbitCh.NotifyClose(make(chan *amqp.Error))
+		log.Printf("Channel closed, attempting to reconnect...")
+		StartRabbitMQ(pool) // Restart the connection
+	}()
+
+	rabbitQ, err = rabbitCh.QueueDeclare(
+		"logs", // name
+		true,   // durable
+		false,  // delete when unused
+		false,  // exclusive
+		false,  // no-wait
+		nil,    // arguments
 	)
-	utils.FailOnError(err, "Failed to declare a queue")
+	if err != nil {
+		log.Panicf("%s: %s", "Failed to declare a queue", err)
+	}
 
 	// Set QoS to ensure fair distribution of messages
-	err = ch.Qos(
+	err = rabbitCh.Qos(
 		1,     // prefetch count
 		0,     // prefetch size
 		false, // global
 	)
-	utils.FailOnError(err, "Failed to set QoS")
+	if err != nil {
+		log.Panicf("%s: %s", "Failed to set QoS", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name,
+	msgs, err := rabbitCh.Consume(
+		rabbitQ.Name,
 		"",
 		false, // auto-acknowledge set to false
 		false, // exclusive
@@ -54,7 +101,9 @@ func StartRabbitMQ(pool *pgxpool.Pool) {
 		false, // no-wait
 		nil,   // args
 	)
-	utils.FailOnError(err, "Failed to register a consumer")
+	if err != nil {
+		log.Panicf("%s: %s", "Failed to register a consumer", err)
+	}
 
 	var forever chan struct{}
 
@@ -62,9 +111,8 @@ func StartRabbitMQ(pool *pgxpool.Pool) {
 		for d := range msgs {
 			var logEntry services.LogEntry
 			if err := json.Unmarshal(d.Body, &logEntry); err != nil {
-				log.Printf("Error parsing message: %v", err)
-				d.Ack(false) // Acknowledge the message even if parsing fails
-				continue
+				// If JSON parsing fails, try to parse as plain text
+				logEntry = parseLogMessage(string(d.Body))
 			}
 			logService.ProcessLog(logEntry)
 			d.Ack(false) // Acknowledge successful processing
@@ -73,4 +121,41 @@ func StartRabbitMQ(pool *pgxpool.Pool) {
 
 	log.Printf(" [*] Waiting for messages. To exit press CTRL+C")
 	<-forever
+}
+
+// Cleanup should be called when the service is shutting down
+func Cleanup() {
+	if rabbitCh != nil {
+		rabbitCh.Close()
+	}
+	if rabbitConn != nil {
+		rabbitConn.Close()
+	}
+}
+
+func parseLogMessage(message string) services.LogEntry {
+	// Default values
+	entry := services.LogEntry{
+		Level:       "INFO",
+		Message:     message,
+		Service:     "unknown",
+		Environment: "production",
+		Hostname:    "unknown",
+		IPAddress:   "unknown",
+		UserID:      "",
+		RequestID:   "",
+		Metadata:    json.RawMessage("{}"),
+	}
+
+	// Try to extract level from [LEVEL] format
+	if len(message) > 0 && message[0] == '[' {
+		endBracket := strings.Index(message, "]")
+		if endBracket > 0 {
+			level := message[1:endBracket]
+			entry.Level = level
+			entry.Message = strings.TrimSpace(message[endBracket+1:])
+		}
+	}
+
+	return entry
 }
